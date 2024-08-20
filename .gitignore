@@ -8,12 +8,6 @@
 **/*.dmp
 **/.thumbs
 
-# No USD files allowed in the repo
-**/*.usd
-**/*.usda
-**/*.usdc
-**/*.usdz
-
 # Python
 .DS_Store
 **/*.egg-info/
@@ -32,7 +26,7 @@ docker/.container.cfg
 **/.vscode/
 # Don't ignore the top-level .vscode directory as it is
 # used to configure VS Code settings
-!.vscode
+# !.vscode
 
 # Outputs
 **/output/*
@@ -46,3 +40,5 @@ docker/artifacts/
 # Doc Outputs
 **/docs/_build/*
 **/generated/*
+
+**/assets/*

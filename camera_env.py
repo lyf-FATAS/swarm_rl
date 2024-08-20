@@ -1,17 +1,23 @@
 from __future__ import annotations
 
-import torch # type: ignore
+import gymnasium as gym
+import numpy as np
+import os
+import torch
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
 
 import omni.isaac.lab.sim as sim_utils
+import omni.isaac.core.utils.prims as prim_utils
 from omni.isaac.lab.assets import Articulation, ArticulationCfg
-from omni.isaac.lab.envs import DirectRLEnv, DirectRLEnvCfg
+from omni.isaac.lab.envs import DirectRLEnv, DirectRLEnvCfg, ViewerCfg
+from omni.isaac.lab.sensors import Camera, CameraCfg, save_images_to_file
 from omni.isaac.lab.envs.ui import BaseEnvWindow
 from omni.isaac.lab.markers import VisualizationMarkers
 from omni.isaac.lab.scene import InteractiveSceneCfg
 from omni.isaac.lab.sim import SimulationCfg
 from omni.isaac.lab.terrains import TerrainImporterCfg
 from omni.isaac.lab.utils import configclass
-from omni.isaac.lab.utils.math import subtract_frame_transforms
 
 ##
 # Pre-defined configs
@@ -23,7 +29,7 @@ from omni.isaac.lab.markers import CUBOID_MARKER_CFG  # isort: skip
 class QuadcopterEnvWindow(BaseEnvWindow):
     """Window manager for the Quadcopter environment."""
 
-    def __init__(self, env: QuadcopterEnv, window_name: str = "IsaacLab"):
+    def __init__(self, env: QuadcopterCameraEnv, window_name: str = "IsaacLab"):
         """Initialize the window.
 
         Args:
@@ -41,14 +47,14 @@ class QuadcopterEnvWindow(BaseEnvWindow):
 
 
 @configclass
-class QuadcopterEnvCfg(DirectRLEnvCfg):
+class QuadcopterRGBCameraEnvCfg(DirectRLEnvCfg):
     # env
     episode_length_s = 13.0
     decimation = 2
     num_actions = 4
-    num_observations = 12
+    num_channels = 3
     num_states = 0
-    debug_vis = True
+    debug_vis = False
 
     ui_window_class_type = QuadcopterEnvWindow
 
@@ -65,6 +71,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
             restitution=0.0,
         ),
     )
+
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="plane",
@@ -79,15 +86,41 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
     )
 
-    # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=4096, env_spacing=2.5, replicate_physics=True
-    )
-
     # robot
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     thrust_to_weight = 1.9
     moment_scale = 0.01
+
+    # camera
+    # Hi there, Isaac Sim does not currently provide independent cameras that don’t see other environments.
+    # One way to workaround it is to build walls around the environments,
+    # which would just be large rectangle prims that block the views of other environments.
+    # Another alternative would be to place the environments far apart, or on different height levels.
+    camera: CameraCfg = CameraCfg(
+        prim_path="/World/envs/env_.*/Robot/body/front_cam",
+        offset=CameraCfg.OffsetCfg(
+            pos=(0.03, 0.0, 0.03), rot=(0.5, -0.5, 0.5, -0.5), convention="ros"
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 10.0),
+        ),
+        width=320,
+        height=240,
+    )
+    num_observations = num_channels * camera.height * camera.width
+    write_image_to_file = False
+
+    # change viewer settings
+    viewer = ViewerCfg(eye=(20.0, 20.0, 20.0))
+
+    # scene
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=256, env_spacing=0.1, replicate_physics=True
+    )
 
     # reward scales
     lin_vel_reward_scale = -0.05
@@ -95,22 +128,51 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     distance_to_goal_reward_scale = 15.0
 
 
-class QuadcopterEnv(DirectRLEnv):
-    cfg: QuadcopterEnvCfg
+@configclass
+class QuadcopterDepthCameraEnvCfg(QuadcopterRGBCameraEnvCfg):
+    # camera
+    camera: CameraCfg = CameraCfg(
+        prim_path="/World/envs/env_.*/Robot/body/front_cam",
+        offset=CameraCfg.OffsetCfg(
+            pos=(0.03, 0.0, 0.03), rot=(0.5, -0.5, 0.5, -0.5), convention="ros"
+        ),
+        data_types=["distance_to_image_plane"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 10.0),
+        ),
+        width=320,
+        height=240,
+    )
 
-    def __init__(self, cfg: QuadcopterEnvCfg, render_mode: str | None = None, **kwargs):
+    # env
+    num_channels = 1
+    num_observations = num_channels * camera.height * camera.width
+
+
+class QuadcopterCameraEnv(DirectRLEnv):
+    cfg: QuadcopterRGBCameraEnvCfg | QuadcopterDepthCameraEnvCfg
+
+    def __init__(
+        self,
+        cfg: QuadcopterRGBCameraEnvCfg | QuadcopterDepthCameraEnvCfg,
+        render_mode: str | None = None,
+        **kwargs,
+    ):
         super().__init__(cfg, render_mode, **kwargs)
 
-        # Total thrust and moment applied to the base of the quadcopter
+        # total thrust and moment applied to the base of the quadcopter
         self._actions = torch.zeros(
             self.num_envs, self.cfg.num_actions, device=self.device
         )
         self._thrust = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._moment = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        # Goal position
+        # goal position
         self._desired_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
 
-        # Logging
+        # logging
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
@@ -119,7 +181,7 @@ class QuadcopterEnv(DirectRLEnv):
                 "distance_to_goal",
             ]
         }
-        # Get specific body indices
+        # get specific body indices
         self._body_id = self._robot.find_bodies("body")[0]
         self._robot_mass = self._robot.root_physx_view.get_masses()[0].sum()
         self._gravity_magnitude = torch.tensor(
@@ -130,19 +192,120 @@ class QuadcopterEnv(DirectRLEnv):
         # add handle for debug visualization (this is set to a valid handle inside set_debug_vis)
         self.set_debug_vis(self.cfg.debug_vis)
 
+        if len(self.cfg.camera.data_types) != 1:
+            raise ValueError(
+                "The Cartpole camera environment only supports one image type at a time but the following were"
+                f" provided: {self.cfg.camera.data_types}"
+            )
+
+    def close(self):
+        """Cleanup for the environment."""
+        super().close()
+
+    def _configure_gym_env_spaces(self):
+        """Configure the action and observation spaces for the Gym environment."""
+        # observation space (unbounded since we don't impose any limits)
+        self.num_actions = self.cfg.num_actions
+        self.num_observations = self.cfg.num_observations
+        self.num_states = self.cfg.num_states
+
+        # set up spaces
+        self.single_observation_space = gym.spaces.Dict()
+        self.single_observation_space["policy"] = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(
+                self.cfg.camera.height,
+                self.cfg.camera.width,
+                self.cfg.num_channels,
+            ),
+        )
+        if self.num_states > 0:
+            self.single_observation_space["critic"] = gym.spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(
+                    self.cfg.camera.height,
+                    self.cfg.camera.width,
+                    self.cfg.num_channels,
+                ),
+            )
+        self.single_action_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.num_actions,)
+        )
+
+        # batch the spaces for vectorized environments
+        self.observation_space = gym.vector.utils.batch_space(
+            self.single_observation_space, self.num_envs
+        )
+        self.action_space = gym.vector.utils.batch_space(
+            self.single_action_space, self.num_envs
+        )
+
+        # RL specifics
+        self.actions = torch.zeros(
+            self.num_envs, self.num_actions, device=self.sim.device
+        )
+
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self._robot
 
+        self._camera = Camera(self.cfg.camera)
+        self.scene.sensors["camera"] = self._camera
+
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+
         # clone, filter, and replicate
         self.scene.clone_environments(copy_from_source=False)
         self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
+
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+        prim_utils.create_prim("/World/Objects", "Xform")
+
+        cfg_cone_rigid = sim_utils.ConeCfg(
+            radius=0.5,
+            height=2.0,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.77, 0.77, 0.77)
+            ),
+        )
+        cfg_cone_rigid.func(
+            "/World/Objects/ConeRigid",
+            cfg_cone_rigid,
+            translation=(-1.0, 0.0, 0.2),
+            orientation=(1.0, 0.0, 0.0, 0.0),
+        )
+
+        cfg_cylinder_rigid = sim_utils.CylinderCfg(
+            radius=0.5,
+            height=2.0,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+            mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.77, 0.77, 0.77)
+            ),
+        )
+        cfg_cylinder_rigid.func(
+            "/World/Objects/CylinderRigid",
+            cfg_cylinder_rigid,
+            translation=(1.0, 0.0, 0.2),
+            orientation=(1.0, 0.0, 0.0, 0.0),
+        )
+
+        # cfg = sim_utils.UsdFileCfg(
+        #     usd_path=script_dir + "/assets/Collected_American_Beech/American_Beech.usd",
+        # )
+        # cfg.func("/World/Objects/Tree", cfg, translation=(1.0, 0.0, 1.0))
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clone().clamp(-1.0, 1.0)
@@ -160,21 +323,14 @@ class QuadcopterEnv(DirectRLEnv):
         )
 
     def _get_observations(self) -> dict:
-        desired_pos_b, _ = subtract_frame_transforms(
-            self._robot.data.root_state_w[:, :3],
-            self._robot.data.root_state_w[:, 3:7],
-            self._desired_pos_w,
+        data_type = (
+            "rgb" if "rgb" in self.cfg.camera.data_types else "distance_to_image_plane"
         )
-        obs = torch.cat(
-            [
-                self._robot.data.root_lin_vel_b,
-                self._robot.data.root_ang_vel_b,
-                self._robot.data.projected_gravity_b,
-                desired_pos_b,
-            ],
-            dim=-1,
-        )
-        observations = {"policy": obs}
+        observations = {"policy": self._camera.data.output[data_type].clone()}
+
+        if self.cfg.write_image_to_file:
+            save_images_to_file(observations["policy"], f"quadcopter_{data_type}.png")
+
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
@@ -199,10 +355,22 @@ class QuadcopterEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        died = torch.logical_or(
+
+        out_of_bounds = torch.logical_or(
             self._robot.data.root_pos_w[:, 2] < -0.1,
             self._robot.data.root_pos_w[:, 2] > 5.2,
         )
+        flipped = (
+            2
+            * (
+                self._robot.data.root_quat_w[:, 0] * self._robot.data.root_quat_w[:, 3]
+                + self._robot.data.root_quat_w[:, 1]
+                * self._robot.data.root_quat_w[:, 2]
+            )
+            < 0.0
+        )
+        died = torch.logical_or(out_of_bounds, flipped)
+
         return died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -278,17 +446,20 @@ class QuadcopterEnv(DirectRLEnv):
         self.goal_pos_visualizer.visualize(self._desired_pos_w)
 
 
-import gymnasium as gym
-import agents
-
 gym.register(
-    id="FAST-Quadcopter-Direct-v0",
-    entry_point=QuadcopterEnv,
+    id="FAST-Quadcopter-RGB-Camera-Direct-v0",
+    entry_point=QuadcopterCameraEnv,
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": QuadcopterEnvCfg,
-        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:QuadcopterPPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
+        "env_cfg_entry_point": QuadcopterRGBCameraEnvCfg,
+    },
+)
+
+gym.register(
+    id="FAST-Quadcopter-Depth-Camera-Direct-v0",
+    entry_point=QuadcopterCameraEnv,
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": QuadcopterDepthCameraEnvCfg,
     },
 )
