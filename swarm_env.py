@@ -7,6 +7,7 @@ from omni.isaac.lab.assets import Articulation, ArticulationCfg
 from omni.isaac.lab.envs import DirectRLEnv, DirectRLEnvCfg
 from omni.isaac.lab.envs.ui import BaseEnvWindow
 from omni.isaac.lab.markers import VisualizationMarkers
+# from omni.isaac.lab.sensors import FrameTransformer, FrameTransformerCfg
 from omni.isaac.lab.scene import InteractiveSceneCfg
 from omni.isaac.lab.sim import SimulationCfg
 from omni.isaac.lab.terrains import TerrainImporterCfg
@@ -45,9 +46,9 @@ class QuadcopterSwarmEnvCfg(DirectRLEnvCfg):
     # env
     episode_length_s = 13.0
     decimation = 2
-    num_drones = 3  # Number of drones per environment
+    num_drones = 4  # Number of drones per environment
     num_actions = 4 * num_drones  # 4 actions per drone
-    num_observations = 12 * num_drones  # 12 observations per drone
+    num_observations = 16 * num_drones  # 16 observations per drone
     num_states = 0
     debug_vis = False
 
@@ -86,9 +87,13 @@ class QuadcopterSwarmEnvCfg(DirectRLEnvCfg):
     )
 
     # robot
-    robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
+    robot: ArticulationCfg = CRAZYFLIE_CFG.copy()
     thrust_to_weight = 1.9
     moment_scale = 0.01
+
+    # odometer: FrameTransformerCfg = FrameTransformerCfg(
+    #     prim_path="/World/envs/env_.*/Robot_0"
+    # )
 
     # reward scales
     lin_vel_reward_scale = -0.05
@@ -147,12 +152,31 @@ class QuadcopterSwarmEnv(DirectRLEnv):
 
     def _setup_scene(self):
         self._robots = []
-        for i in range(self.num_drones):
+        for i in range(self.cfg.num_drones):
+            row = i // (self.cfg.num_drones // 2)
+            col = i % (self.cfg.num_drones // 2)
+            init_pos = (row * 0.25, col * 0.25, 0.0)
+
             robot = Articulation(
-                self.cfg.robot.replace(prim_path=f"/World/envs/env_.*/Robot_{i}")
+                self.cfg.robot.replace(
+                    prim_path=f"/World/envs/env_.*/Robot_{i}",
+                    init_state=self.cfg.robot.init_state.replace(pos=init_pos),
+                )
             )
             self.scene.articulations[f"robot_{i}"] = robot
             self._robots.append(robot)
+
+        # self._odometer = FrameTransformer(
+        #     self.cfg.odometer.replace(
+        #         target_frames=[
+        #             FrameTransformerCfg.FrameCfg(
+        #                 prim_path=f"/World/envs/env_.*/Robot_{i}"
+        #             )
+        #             for i in range(self.cfg.num_drones)
+        #         ]
+        #     )
+        # )
+        # self.scene.sensors["odometer"] = self._odometer
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
@@ -167,7 +191,6 @@ class QuadcopterSwarmEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        actions = actions.view(self.num_envs, self.num_drones, -1)
         self._actions = actions.clone().clamp(-1.0, 1.0)
         for i in range(self.num_drones):
             self._thrust[:, i, 2] = (
@@ -181,28 +204,25 @@ class QuadcopterSwarmEnv(DirectRLEnv):
     def _apply_action(self):
         for i in range(self.num_drones):
             self._robots[i].set_external_force_and_torque(
-                self._thrust[:, i, :], self._moment[:, i, :], body_ids=self._body_id
+                self._thrust[:, i : i + 1, :],
+                self._moment[:, i : i + 1, :],
+                body_ids=self._body_id,
             )
 
     def _get_observations(self) -> dict:
         obs_list = []
         for i in range(self.num_drones):
-            desired_pos_b, _ = subtract_frame_transforms(
-                self._robots[i].data.root_state_w[:, :3],
-                self._robots[i].data.root_state_w[:, 3:7],
-                self._desired_pos_w[:, i, :],
-            )
             obs = torch.cat(
                 [
-                    self._robots[i].data.root_lin_vel_b,
-                    self._robots[i].data.root_ang_vel_b,
+                    self._robots[i].data.root_pos_w,
+                    self._robots[i].data.root_quat_w,
+                    self._robots[i].data.root_vel_w,
                     self._robots[i].data.projected_gravity_b,
-                    desired_pos_b,
                 ],
                 dim=-1,
             )
             obs_list.append(obs)
-        observations = {"policy": torch.cat(obs_list, dim=-1)}
+        observations = {"policy": torch.stack(obs_list, dim=1)}
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
@@ -304,6 +324,7 @@ class QuadcopterSwarmEnv(DirectRLEnv):
             self._desired_pos_w[env_ids, i, 2] = torch.zeros_like(
                 self._desired_pos_w[env_ids, i, 2]
             ).uniform_(0.5, 1.5)
+
             # Reset robot state
             joint_pos = self._robots[i].data.default_joint_pos[env_ids]
             joint_vel = self._robots[i].data.default_joint_vel[env_ids]

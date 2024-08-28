@@ -41,4 +41,4 @@ docker/artifacts/
 **/docs/_build/*
 **/generated/*
 
-**/assets/*
+assets/*

@@ -13,7 +13,7 @@ parser.add_argument(
     help="Disable fabric and use USD I/O operations.",
 )
 parser.add_argument(
-    "--num_envs", type=int, default=None, help="Number of environments to simulate."
+    "--num_envs", type=int, default=13, help="Number of environments to simulate."
 )
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
@@ -167,13 +167,17 @@ def main():
             actions = torch.tensor(action, device=env.unwrapped.device).repeat(
                 env.unwrapped.num_envs, 1
             )
-            
-            # if args_cli.task == "":
-            #     actions = actions.view(self.num_envs, self.num_drones, -1)
+            if args_cli.task == "FAST-Quadcopter-Swarm-Direct-v0":
+                actions = actions.unsqueeze(1).repeat(1, env_cfg.num_drones, 1)
 
             # apply actions
             obs, _, _, _, _ = env.step(actions)
-            visualize_images_live(obs["policy"].cpu().numpy())
+
+            if args_cli.task in [
+                "FAST-Quadcopter-RGB-Camera-Direct-v0",
+                "FAST-Quadcopter-Depth-Camera-Direct-v0",
+            ]:
+                visualize_images_live(obs["policy"].cpu().numpy())
 
     # close the simulator
     env.close()

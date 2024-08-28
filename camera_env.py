@@ -119,7 +119,7 @@ class QuadcopterRGBCameraEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=256, env_spacing=0.1, replicate_physics=True
+        num_envs=256, env_spacing=2.5, replicate_physics=True
     )
 
     # reward scales
